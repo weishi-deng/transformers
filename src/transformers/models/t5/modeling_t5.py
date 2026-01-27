@@ -38,6 +38,7 @@ from ...modeling_outputs import (
 from ...modeling_utils import PreTrainedModel
 from ...utils import DUMMY_INPUTS, DUMMY_MASK, auto_docstring, logging, torch_compilable_check
 from .configuration_t5 import T5Config
+import torch.nn.functional as F
 
 
 logger = logging.get_logger(__name__)
@@ -311,22 +312,19 @@ class T5Attention(nn.Module):
                 if is_cross_attention and isinstance(past_key_values, EncoderDecoderCache):
                     past_key_values.is_updated[self.layer_idx] = True
 
-        # compute scores, equivalent of torch.einsum("bnqd,bnkd->bnqk", query_states, key_states), compatible with onnx op>9
-        scores = torch.matmul(query_states, key_states.transpose(3, 2))
-
         if position_bias is None:
             key_length = key_states.shape[-2]
             # cache position is 0-indexed so we add 1 to get the real length of queries (aka with past)
             real_seq_length = query_length if query_length is not None else cache_position[-1] + 1
             if not self.has_relative_attention_bias:
                 position_bias = torch.zeros(
-                    (1, self.n_heads, seq_length, key_length), device=scores.device, dtype=scores.dtype
+                    (1, self.n_heads, seq_length, key_length), device=query_states.device, dtype=query_states.dtype
                 )
                 if self.gradient_checkpointing and self.training:
                     position_bias.requires_grad = True
             else:
                 position_bias = self.compute_bias(
-                    real_seq_length, key_length, device=scores.device, cache_position=cache_position
+                    real_seq_length, key_length, device=query_states.device, cache_position=cache_position
                 )
                 position_bias = position_bias[:, :, -seq_length:, :]
 
@@ -334,14 +332,17 @@ class T5Attention(nn.Module):
                 causal_mask = mask[:, :, :, : key_states.shape[-2]]
                 position_bias = position_bias + causal_mask
 
-        position_bias_masked = position_bias
-        scores += position_bias_masked
+        position_bias_masked = position_bias.contiguous()
 
         # (batch_size, n_heads, seq_length, key_length)
-        attn_weights = nn.functional.softmax(scores.float(), dim=-1).type_as(scores)
-        attn_weights = nn.functional.dropout(attn_weights, p=self.dropout, training=self.training)
-
-        attn_output = torch.matmul(attn_weights, value_states)
+        attn_output = F.scaled_dot_product_attention(
+            query_states,
+            key_states,
+            value_states,
+            attn_mask=position_bias_masked,
+            dropout_p=self.dropout if self.training else 0.0,
+            scale = 1.0,
+        )
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.view(batch_size, -1, self.inner_dim)
